@@ -1,0 +1,26 @@
+{
+  "_comment": "real questions about YOUR documents.",
+
+  "session_id": "eval",
+
+  "cases": [
+    {
+      "id": "q1",
+      "question": "What is this document about?",
+      "expected_sources": ["your_document.pdf"],
+      "ground_truth_answer": "Replace with the correct answer, written by hand from the source document."
+    },
+    {
+      "id": "q2",
+      "question": "Ask a second, more specific question about a fact inside your document.",
+      "expected_sources": ["your_document.pdf"],
+      "ground_truth_answer": "Replace with the correct, specific answer."
+    },
+    {
+      "id": "q3",
+      "question": "Ask a question whose answer is NOT in any ingested document.",
+      "expected_sources": [],
+      "ground_truth_answer": "The system should say it does not have relevant information."
+    }
+  ]
+}
