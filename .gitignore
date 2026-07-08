@@ -1,4 +1,9 @@
 Depi_GenAi/
+venv/
+*.pyc
+.env
+finetune/models/
+finetune/output/
 
 # Python
 __pycache__/

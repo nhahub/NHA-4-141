@@ -1,288 +1,155 @@
 import os
 from typing import List, Dict, Any, Optional
-from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from qdrant_client.http.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PayloadSchemaType
+import faiss
+import numpy as np
 from langchain_core.documents import Document
 import uuid
+import pickle
 
-class QdrantVectorStore:
+
+class FAISSVectorStore:
     """
-    Qdrant vector store implementation with session-based filtering.
-    
-    This class handles all vector database operations including:
-    - Collection management and indexing
-    - Document storage with metadata
-    - Similarity search with filtering
-    - Session-based data isolation
+    FAISS vector store — replaces Qdrant completely.
+    Runs 100% in memory, no server needed, no connection errors.
     """
-    
+
     def __init__(self):
-        """Initialize Qdrant client and collection"""
-        # Initialize Qdrant client with cloud credentials
-        self.client = QdrantClient(
-            ":memory:"
-        )
-        
-        # Collection configuration
-        self.collection_name = os.getenv("COLLECTION_NAME", "rag_documents")
-        self.vector_size = 768  # nomic-embed-text embedding dimension
-        
-        # Ensure collection exists with proper configuration
-        self._ensure_collection_exists()
-    
-    def _ensure_collection_exists(self):
-        """Create collection if it doesn't exist with proper indexing for efficient filtering"""
-        try:
-            # Check if collection already exists
-            collections = self.client.get_collections()
-            collection_names = [col.name for col in collections.collections]
-            
-            if self.collection_name not in collection_names:
-                # Create new collection with vector configuration
-                self.client.create_collection(
-                    collection_name=self.collection_name,
-                    vectors_config=VectorParams(
-                        size=self.vector_size,      # Embedding dimension
-                        distance=Distance.COSINE    # Cosine similarity for semantic search
-                    )
-                )
-                print(f"Created collection: {self.collection_name}")
-            
-            # Create payload indexes for efficient filtering
-            # Session ID index for session-based isolation
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name="session_id",
-                    field_schema=PayloadSchemaType.KEYWORD
-                )
-                print("Created session_id index")
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    print(f"Note: Could not create session_id index: {e}")
-            
-            # Source type index for filtering by document/web content
-            try:
-                self.client.create_payload_index(
-                    collection_name=self.collection_name,
-                    field_name="source_type",
-                    field_schema=PayloadSchemaType.KEYWORD
-                )
-                print("Created source_type index")
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    print(f"Note: Could not create source_type index: {e}")
-                
-        except Exception as e:
-            print(f"Error ensuring collection exists: {e}")
-            raise
-    
+        self.vector_size = 768
+        self.index = faiss.IndexFlatL2(self.vector_size)
+        # Store metadata separately — FAISS only stores vectors
+        self.documents: List[Document] = []
+        self.ids: List[str] = []
+        print("FAISS vector store initialized ✅")
+
     def add_documents(self, documents: List[Document], embeddings: List[List[float]]) -> bool:
-        """
-        Add documents with embeddings to the vector store.
-        
-        Args:
-            documents: List of Document objects with content and metadata
-            embeddings: List of embedding vectors corresponding to documents
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
         try:
-            points = []
-            
-            # Create point objects for each document-embedding pair
-            for i, (doc, embedding) in enumerate(zip(documents, embeddings)):
-                # Skip documents with invalid embeddings
-                if not embedding or len(embedding) == 0:
-                    print(f"Skipping document {i} due to invalid embedding")
+            valid_docs = []
+            valid_embeddings = []
+
+            for doc, emb in zip(documents, embeddings):
+                if not emb or len(emb) == 0:
                     continue
-                
-                # Create point with unique ID, vector, and metadata
-                point = PointStruct(
-                    id=str(uuid.uuid4()),  # Unique identifier
-                    vector=embedding,       # Vector representation
-                    payload={               # Metadata for filtering and retrieval
-                        "content": doc.page_content,
-                        "source_type": doc.metadata.get("source_type"),
-                        "source_name": doc.metadata.get("source_name"),
-                        "session_id": doc.metadata.get("session_id"),
-                        "chunk_id": doc.metadata.get("chunk_id", i)
-                    }
-                )
-                points.append(point)
-            
-            # Validate that we have points to upload
-            if not points:
-                print("No valid points to upload")
+                if len(emb) != self.vector_size:
+                    print(f"Skipping embedding with wrong size: {len(emb)} != {self.vector_size}")
+                    continue
+                valid_docs.append(doc)
+                valid_embeddings.append(emb)
+
+            if not valid_docs:
+                print("No valid documents to add")
                 return False
-            
-            # Upload points to Qdrant collection
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points
-            )
-            
-            print(f"Successfully added {len(points)} documents to vector store")
+
+            vectors = np.array(valid_embeddings, dtype=np.float32)
+            self.index.add(vectors)
+
+            for doc in valid_docs:
+                self.documents.append(doc)
+                self.ids.append(str(uuid.uuid4()))
+
+            print(f"✅ Added {len(valid_docs)} documents to FAISS. Total: {len(self.documents)}")
             return True
-            
+
         except Exception as e:
-            print(f"Error adding documents to vector store: {e}")
+            print(f"Error adding documents to FAISS: {e}")
             return False
-    
+
     def similarity_search(
-        self, 
-        query_embedding: List[float], 
-        k: int = 5, 
+        self,
+        query_embedding: List[float],
+        k: int = 5,
         filter_dict: Optional[Dict[str, Any]] = None
     ) -> List[Document]:
-        """
-        Search for similar documents with optional filtering.
-        
-        Args:
-            query_embedding: Query vector for similarity search
-            k: Number of similar documents to return
-            filter_dict: Optional filters (e.g., {"session_id": "abc123"})
-            
-        Returns:
-            List of Document objects with similarity scores
-        """
         try:
-            # Validate query embedding
             if not query_embedding or len(query_embedding) == 0:
-                print("Invalid query embedding")
                 return []
-            
-            # Build filter conditions if provided
-            query_filter = None
-            if filter_dict:
-                conditions = []
-                for key, value in filter_dict.items():
-                    conditions.append(
-                        FieldCondition(
-                            key=key,
-                            match=MatchValue(value=value)
-                        )
+
+            if self.index.ntotal == 0:
+                print("FAISS index is empty — no documents loaded yet")
+                return []
+
+            query_vector = np.array([query_embedding], dtype=np.float32)
+
+            # Search more candidates if filtering is needed
+            search_k = min(self.index.ntotal, k * 10 if filter_dict else k)
+            distances, indices = self.index.search(query_vector, search_k)
+
+            results = []
+            for idx in indices[0]:
+                if idx == -1 or idx >= len(self.documents):
+                    continue
+
+                doc = self.documents[idx]
+
+                # Apply metadata filters if provided
+                if filter_dict:
+                    match = all(
+                        doc.metadata.get(key) == value
+                        for key, value in filter_dict.items()
                     )
-                query_filter = Filter(must=conditions)
-            
-            # Perform similarity search in vector space
-            search_results = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=query_embedding,
-                query_filter=query_filter,
-                limit=k
-            )
-            
-            # Convert search results to Document objects
-            documents = []
-            for result in search_results:
-                doc = Document(
-                    page_content=result.payload["content"],
-                    metadata={
-                        "source_type": result.payload.get("source_type"),
-                        "source_name": result.payload.get("source_name"),
-                        "session_id": result.payload.get("session_id"),
-                        "chunk_id": result.payload.get("chunk_id"),
-                        "score": result.score  # Similarity score
-                    }
-                )
-                documents.append(doc)
-            
-            return documents
-            
+                    if not match:
+                        continue
+
+                results.append(doc)
+                if len(results) >= k:
+                    break
+
+            return results
+
         except Exception as e:
-            print(f"Error performing similarity search: {e}")
+            print(f"Error in FAISS similarity search: {e}")
             return []
-    
+
     def get_documents_by_session(self, session_id: str) -> List[dict]:
-        """
-        Get all documents for a specific session.
-        
-        Args:
-            session_id: Session identifier
-            
-        Returns:
-            List of document dictionaries with metadata
-        """
         try:
-            # Use scroll to get all documents for the session
-            points, _ = self.client.scroll(
-                collection_name=self.collection_name,
-                scroll_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="session_id",
-                            match=MatchValue(value=session_id)
-                        )
-                    ]
-                ),
-                limit=1000  # Adjust based on expected session size
-            )
-            
-            # Convert points to document dictionaries
-            documents = []
-            for point in points:
-                documents.append({
-                    "id": point.id,
-                    "content": point.payload["content"],
-                    "source_type": point.payload.get("source_type"),
-                    "source_name": point.payload.get("source_name"),
-                    "chunk_id": point.payload.get("chunk_id")
-                })
-            
-            return documents
-            
+            return [
+                {
+                    "id": self.ids[i],
+                    "content": doc.page_content,
+                    "source_type": doc.metadata.get("source_type"),
+                    "source_name": doc.metadata.get("source_name"),
+                    "chunk_id": doc.metadata.get("chunk_id"),
+                    "page": doc.metadata.get("page")
+                }
+                for i, doc in enumerate(self.documents)
+                if doc.metadata.get("session_id") == session_id
+            ]
         except Exception as e:
             print(f"Error getting documents by session: {e}")
             return []
-    
+
     def delete_by_session(self, session_id: str) -> bool:
-        """
-        Delete all documents for a specific session.
-        
-        Args:
-            session_id: Session identifier
-            
-        Returns:
-            bool: True if successful, False otherwise
-        """
+        """Remove all documents for a session and rebuild the FAISS index."""
         try:
-            # Delete all points matching the session ID
-            self.client.delete(
-                collection_name=self.collection_name,
-                points_selector=Filter(
-                    must=[
-                        FieldCondition(
-                            key="session_id",
-                            match=MatchValue(value=session_id)
-                        )
-                    ]
-                )
-            )
-            print(f"Deleted all documents for session: {session_id}")
+            keep_docs = []
+            keep_ids = []
+            keep_embeddings = []
+
+            # We need to rebuild — collect docs to keep
+            for i, doc in enumerate(self.documents):
+                if doc.metadata.get("session_id") != session_id:
+                    keep_docs.append(doc)
+                    keep_ids.append(self.ids[i])
+
+            # Rebuild index without deleted docs
+            self.index = faiss.IndexFlatL2(self.vector_size)
+            self.documents = keep_docs
+            self.ids = keep_ids
+
+            print(f"Deleted session {session_id} — {len(self.documents)} docs remain")
             return True
-            
+
         except Exception as e:
-            print(f"Error deleting documents by session: {e}")
+            print(f"Error deleting session from FAISS: {e}")
             return False
-    
+
     def get_collection_info(self) -> dict:
-        """
-        Get information about the collection.
-        
-        Returns:
-            Dictionary with collection statistics
-        """
-        try:
-            info = self.client.get_collection(self.collection_name)
-            return {
-                "name": self.collection_name,
-                "vector_size": info.config.params.vectors.size,
-                "vectors_count": info.vectors_count,
-                "points_count": info.points_count
-            }
-        except Exception as e:
-            print(f"Error getting collection info: {e}")
-            return {}
+        return {
+            "name": "faiss_index",
+            "vector_size": self.vector_size,
+            "vectors_count": self.index.ntotal,
+            "points_count": len(self.documents)
+        }
+
+
+# Keep old name as alias so rag_pipeline.py doesn't need changes
+QdrantVectorStore = FAISSVectorStore

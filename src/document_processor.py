@@ -1,8 +1,13 @@
 import os
-from typing import List
+from typing import Dict, List, Optional
 import PyPDF2
 import pandas as pd
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from docx import Document as DocxDocument
+from pptx import Presentation
+import openpyxl
+import markdown
+from bs4 import BeautifulSoup
 
 class DocumentProcessor:
     """
@@ -24,7 +29,7 @@ class DocumentProcessor:
             length_function=len,  # Function to measure chunk length
         )
     
-    def process_document(self, file_path: str, filename: str) -> List[str]:
+    def process_document(self, file_path: str, filename: str) -> List[Dict]:
         """
         Process a document based on its file extension.
         
@@ -33,7 +38,11 @@ class DocumentProcessor:
             filename: Original filename for extension detection
             
         Returns:
-            List of text chunks from the document
+            List of chunk dicts: {"text": <chunk text>, "page": <page/slide/
+            sheet label or None>}. The "page" label enables page-level
+            citations (e.g. "notes.pdf, p.3") when the source format has a
+            natural page-like unit (PDF pages, PPTX slides, XLSX sheets);
+            it's None for formats without one (TXT, CSV, DOCX, Markdown).
         """
         # Determine processing method based on file extension
         file_extension = filename.lower().split('.')[-1]
@@ -44,10 +53,18 @@ class DocumentProcessor:
             return self._process_txt(file_path)
         elif file_extension == 'csv':
             return self._process_csv(file_path)
+        elif file_extension == 'docx':
+            return self._process_docx(file_path)
+        elif file_extension == 'pptx':
+            return self._process_pptx(file_path)
+        elif file_extension in ('xlsx', 'xls'):
+            return self._process_xlsx(file_path)
+        elif file_extension == 'md':
+            return self._process_markdown(file_path)
         else:
             raise ValueError(f"Unsupported file type: {file_extension}")
     
-    def process_text(self, text: str, source_name: str) -> List[str]:
+    def process_text(self, text: str, source_name: str) -> List[Dict]:
         """
         Process raw text and split into chunks.
         
@@ -56,77 +73,108 @@ class DocumentProcessor:
             source_name: Name of the source (for error reporting)
             
         Returns:
-            List of text chunks
+            List of chunk dicts: {"text": <chunk text>, "page": None}. No
+            page-like unit exists for raw text (e.g. scraped web content),
+            so "page" is always None here.
         """
         if not text.strip():
             return []
         
         # Split text into manageable chunks
-        chunks = self.text_splitter.split_text(text)
-        return chunks
-    
-    def _process_pdf(self, file_path: str) -> List[str]:
+        return self._wrap_chunks(self.text_splitter.split_text(text), page=None)
+
+    def _wrap_chunks(self, chunks: List[str], page: Optional[object]) -> List[Dict]:
         """
-        Extract text from PDF file with multiple fallback methods.
+        Tag a list of raw text chunks with a page/slide/sheet label.
+
+        Args:
+            chunks: Plain text chunks from the text splitter
+            page: Label to attach to every chunk (an int page/slide number,
+                  a sheet name string, or None if no such unit applies)
+
+        Returns:
+            List of {"text": ..., "page": ...} dicts
+        """
+        return [{"text": chunk, "page": page} for chunk in chunks]
+    
+    def _process_pdf(self, file_path: str) -> List[Dict]:
+        """
+        Extract text from PDF file with multiple fallback methods, tracking
+        which page each extracted chunk came from so citations can point
+        to a specific page.
         
         This method tries several approaches to handle different PDF types:
-        1. PyPDF2 with character cleaning
-        2. pdfplumber (if available)
-        3. Binary extraction fallback
-        4. Pattern-based extraction
+        1. PyPDF2 with character cleaning (page-accurate)
+        2. pdfplumber (if available, also page-accurate)
+        3. Binary extraction fallback (page info lost)
+        4. Pattern-based extraction (page info lost)
         
         Args:
             file_path: Path to PDF file
             
         Returns:
-            List of text chunks from PDF
+            List of {"text": ..., "page": <1-indexed page number or None>} dicts
         """
-        text = ""
+        # pages_text holds (page_number, cleaned_page_text) for methods that
+        # can tell us which page text came from.
+        pages_text = []
         
         # Method 1: Try PyPDF2 with character cleaning
         try:
             with open(file_path, 'rb') as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 
-                for page_num, page in enumerate(pdf_reader.pages):
+                for page_num, page in enumerate(pdf_reader.pages, start=1):
                     try:
                         page_text = page.extract_text()
                         if page_text:
                             # Clean the text to remove problematic characters
                             page_text = self._clean_pdf_text(page_text)
-                            text += page_text + "\n"
+                            if page_text.strip():
+                                pages_text.append((page_num, page_text))
                     except Exception as e:
-                        print(f"Warning: Could not extract text from page {page_num + 1}: {e}")
+                        print(f"Warning: Could not extract text from page {page_num}: {e}")
                         continue
                         
         except Exception as e:
             print(f"PyPDF2 extraction failed: {e}")
         
         # Method 2: Try pdfplumber if PyPDF2 failed or produced no text
-        if not text.strip():
+        if not pages_text:
             try:
                 import pdfplumber
                 print("Trying pdfplumber for PDF extraction...")
                 with pdfplumber.open(file_path) as pdf:
-                    for page_num, page in enumerate(pdf.pages):
+                    for page_num, page in enumerate(pdf.pages, start=1):
                         try:
                             page_text = page.extract_text()
                             if page_text:
-                                text += self._clean_pdf_text(page_text) + "\n"
+                                cleaned = self._clean_pdf_text(page_text)
+                                if cleaned.strip():
+                                    pages_text.append((page_num, cleaned))
                         except Exception as e:
-                            print(f"pdfplumber: Could not extract from page {page_num + 1}: {e}")
+                            print(f"pdfplumber: Could not extract from page {page_num}: {e}")
                             continue
             except ImportError:
                 print("pdfplumber not available")
             except Exception as e:
                 print(f"pdfplumber extraction failed: {e}")
         
-        # Method 3: Binary extraction fallback
-        if not text.strip():
-            print("Trying binary extraction fallback...")
-            text = self._extract_pdf_binary_fallback(file_path)
+        # If we got page-accurate text, split each page independently so
+        # every resulting chunk can be tagged with its correct page number.
+        if pages_text:
+            chunks = []
+            for page_num, page_text in pages_text:
+                for chunk in self.text_splitter.split_text(page_text):
+                    chunks.append({"text": chunk, "page": page_num})
+            if chunks:
+                return chunks
         
-        # Method 4: OCR-like text pattern extraction
+        # Method 3: Binary extraction fallback (page info is lost here)
+        print("Trying binary extraction fallback...")
+        text = self._extract_pdf_binary_fallback(file_path)
+        
+        # Method 4: OCR-like text pattern extraction (page info is lost here)
         if not text.strip():
             print("Trying pattern-based text extraction...")
             text = self._extract_pdf_pattern_fallback(file_path)
@@ -135,7 +183,7 @@ class DocumentProcessor:
         if not text.strip():
             raise ValueError("No text could be extracted from the PDF. The PDF might be image-based, corrupted, or password-protected. Try converting it to a text-based PDF first.")
         
-        return self.text_splitter.split_text(text)
+        return self._wrap_chunks(self.text_splitter.split_text(text), page=None)
     
     def _clean_pdf_text(self, text: str) -> str:
         """
@@ -264,7 +312,7 @@ class DocumentProcessor:
             print(f"Pattern extraction failed: {e}")
             return ""
     
-    def _process_txt(self, file_path: str) -> List[str]:
+    def _process_txt(self, file_path: str) -> List[Dict]:
         """
         Process plain text file with multiple encoding support.
         
@@ -272,7 +320,7 @@ class DocumentProcessor:
             file_path: Path to text file
             
         Returns:
-            List of text chunks
+            List of {"text": ..., "page": None} chunk dicts
         """
         try:
             # Try multiple encodings to handle different file types
@@ -296,12 +344,12 @@ class DocumentProcessor:
             if not text.strip():
                 raise ValueError("The text file is empty")
             
-            return self.text_splitter.split_text(text)
+            return self._wrap_chunks(self.text_splitter.split_text(text), page=None)
             
         except Exception as e:
             raise ValueError(f"Error processing text file: {str(e)}")
     
-    def _process_csv(self, file_path: str) -> List[str]:
+    def _process_csv(self, file_path: str) -> List[Dict]:
         """
         Process CSV file with encoding detection and structure preservation.
         
@@ -309,7 +357,7 @@ class DocumentProcessor:
             file_path: Path to CSV file
             
         Returns:
-            List of text chunks representing CSV data
+            List of {"text": ..., "page": None} chunk dicts representing CSV data
         """
         try:
             # Try multiple encodings for CSV files
@@ -363,10 +411,185 @@ class DocumentProcessor:
             # Join all parts into final text
             full_text = "\n".join(text_parts)
             
-            return self.text_splitter.split_text(full_text)
+            return self._wrap_chunks(self.text_splitter.split_text(full_text), page=None)
             
         except Exception as e:
             raise ValueError(f"Error processing CSV file: {str(e)}")
+    
+    def _process_docx(self, file_path: str) -> List[Dict]:
+        """
+        Extract text from a Word (.docx) document, including paragraphs and tables.
+        
+        Args:
+            file_path: Path to DOCX file
+            
+        Returns:
+            List of {"text": ..., "page": None} chunk dicts. DOCX doesn't
+            expose a reliable page count (pagination depends on the reader/
+            renderer), so no page label is attached.
+        """
+        try:
+            doc = DocxDocument(file_path)
+            text_parts = []
+            
+            # Extract paragraph text
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    text_parts.append(para.text)
+            
+            # Extract table content (rows joined with " | ")
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(cell.text for cell in row.cells)
+                    if row_text.strip():
+                        text_parts.append(row_text)
+            
+            full_text = "\n".join(text_parts)
+            
+            if not full_text.strip():
+                raise ValueError("The DOCX file appears to be empty")
+            
+            return self._wrap_chunks(self.text_splitter.split_text(full_text), page=None)
+            
+        except Exception as e:
+            raise ValueError(f"Error processing DOCX file: {str(e)}")
+    
+    def _process_pptx(self, file_path: str) -> List[Dict]:
+        """
+        Extract text from a PowerPoint (.pptx) presentation, slide by slide,
+        tagging each resulting chunk with its slide number for citations.
+        
+        Args:
+            file_path: Path to PPTX file
+            
+        Returns:
+            List of {"text": ..., "page": <slide number>} chunk dicts
+        """
+        try:
+            prs = Presentation(file_path)
+            slides_text = []  # (slide_number, slide_text)
+            
+            for i, slide in enumerate(prs.slides, start=1):
+                slide_lines = []
+                
+                for shape in slide.shapes:
+                    # Extract text from text frames (titles, bullet points, etc.)
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            run_text = "".join(run.text for run in para.runs)
+                            if run_text.strip():
+                                slide_lines.append(run_text)
+                    
+                    # Extract text from tables on the slide
+                    if shape.has_table:
+                        for row in shape.table.rows:
+                            row_text = " | ".join(cell.text for cell in row.cells)
+                            if row_text.strip():
+                                slide_lines.append(row_text)
+                
+                # Only keep slides that had actual content
+                if slide_lines:
+                    slides_text.append((i, "\n".join(slide_lines)))
+            
+            if not slides_text:
+                raise ValueError("No text could be extracted from the PPTX. It might contain only images.")
+            
+            chunks = []
+            for slide_num, slide_text in slides_text:
+                for chunk in self.text_splitter.split_text(slide_text):
+                    chunks.append({"text": chunk, "page": slide_num})
+            
+            return chunks
+            
+        except Exception as e:
+            raise ValueError(f"Error processing PPTX file: {str(e)}")
+    
+    def _process_xlsx(self, file_path: str) -> List[Dict]:
+        """
+        Extract data from an Excel (.xlsx) workbook, sheet by sheet, tagging
+        each resulting chunk with its sheet name for citations.
+        
+        Args:
+            file_path: Path to XLSX file
+            
+        Returns:
+            List of {"text": ..., "page": <sheet name>} chunk dicts
+        """
+        try:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            sheets_text = []  # (sheet_name, sheet_text)
+            
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                text_parts = []
+                
+                row_count = 0
+                for row in ws.iter_rows(values_only=True):
+                    row_vals = [str(cell) for cell in row if cell is not None]
+                    if row_vals:
+                        text_parts.append(" | ".join(row_vals))
+                        row_count += 1
+                    # Limit rows per sheet for performance, similar to CSV handling
+                    if row_count >= 500:
+                        text_parts.append(f"... (sheet truncated after {row_count} rows)")
+                        break
+                
+                if text_parts:
+                    sheets_text.append((sheet_name, "\n".join(text_parts)))
+            
+            if not sheets_text:
+                raise ValueError("The XLSX file appears to be empty")
+            
+            chunks = []
+            for sheet_name, sheet_text in sheets_text:
+                for chunk in self.text_splitter.split_text(sheet_text):
+                    chunks.append({"text": chunk, "page": sheet_name})
+            
+            return chunks
+            
+        except Exception as e:
+            raise ValueError(f"Error processing XLSX file: {str(e)}")
+    
+    def _process_markdown(self, file_path: str) -> List[Dict]:
+        """
+        Extract plain text from a Markdown (.md) file by rendering to HTML
+        and stripping tags, so formatting syntax doesn't pollute the context.
+        
+        Args:
+            file_path: Path to Markdown file
+            
+        Returns:
+            List of {"text": ..., "page": None} chunk dicts
+        """
+        try:
+            # Try multiple encodings, consistent with _process_txt
+            encodings = ['utf-8', 'utf-16', 'latin-1', 'cp1252']
+            raw_text = None
+            
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        raw_text = f.read()
+                    break
+                except UnicodeDecodeError:
+                    continue
+            
+            if raw_text is None:
+                with open(file_path, 'rb') as f:
+                    raw_text = f.read().decode('utf-8', errors='ignore')
+            
+            # Convert markdown to HTML, then strip tags to get clean text
+            html = markdown.markdown(raw_text, extensions=['tables', 'fenced_code'])
+            soup = BeautifulSoup(html, 'html.parser')
+            text = soup.get_text(separator='\n')
+            
+            if not text.strip():
+                raise ValueError("The Markdown file is empty")
+            
+            return self._wrap_chunks(self.text_splitter.split_text(text), page=None)
+            
+        except Exception as e:
+            raise ValueError(f"Error processing Markdown file: {str(e)}")
     
     def get_file_info(self, file_path: str) -> dict:
         """

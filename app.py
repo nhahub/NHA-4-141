@@ -1,431 +1,459 @@
 import streamlit as st
-import os
+import io
 import re
-from dotenv import load_dotenv
+import os
+import uuid
+import tempfile
+from docx import Document as DocxDocument
+
+# ── Backend imports ──────────────────────────────────────────────────────────
 from src.rag_pipeline import RAGPipeline
 from src.document_processor import DocumentProcessor
 from src.web_scraper import WebScraper
-import uuid
-import tempfile
+from src.web_search import WebSearchClient
+from src.llm_router import LLMRouter
+from src.conversation_memory import ConversationMemory
 
-# Load environment variables from .env file
-load_dotenv()
-
-# Page configuration - must be the first Streamlit command
+# ==============================================================================
+# 1. PAGE CONFIGURATION
+# ==============================================================================
 st.set_page_config(
-    page_title="RAG Assistant",
+    page_title="Alies AI ChatBot RAG System",
     page_icon="🤖",
-    layout="centered",
-    initial_sidebar_state="collapsed"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Custom CSS for clean, minimal styling with improved UX
 st.markdown("""
 <style>
-    .main { padding-top: 2rem; }
-    .stApp > header { background-color: transparent; }
-    .element-container:has(> .stMarkdown > div[data-testid="stMarkdownContainer"] > p:empty) { display: none; }
-    .stMarkdown > div[data-testid="stMarkdownContainer"]:empty { display: none; }
-    .upload-box {
-        border: 2px dashed #cccccc;
-        border-radius: 10px;
-        padding: 2rem;
-        text-align: center;
-        margin: 1rem 0;
-        background-color: #fafafa;
-    }
+    .stChatInputContainer { padding-bottom: 20px; }
+    div[data-testid="stSidebarUserContent"] { padding-top: 1rem; }
+    div[data-testid="stPopover"] button svg { display: none; }
     .source-tag {
         background-color: #fff3e0;
         color: #f57c00;
-        padding: 0.2rem 0.5rem;
+        padding: 2px 8px;
         border-radius: 4px;
-        font-size: 0.8rem;
-        margin: 0.2rem;
+        font-size: 0.78rem;
+        margin: 2px 2px;
         display: inline-block;
     }
-    .status-indicator {
-        padding: 0.5rem 1rem;
-        border-radius: 20px;
-        font-size: 0.9rem;
-        margin: 0.5rem 0;
-        text-align: center;
-    }
-    .status-ready { background-color: #e8f5e8; color: #2e7d32; }
-    .status-empty { background-color: #fff3e0; color: #f57c00; }
-    .status-warning { background-color: #ffebee; color: #c62828; }
-    .stButton > button {
-        background-color: #1976d2;
-        color: white;
-        border: none;
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
-        font-weight: 500;
-        transition: background-color 0.3s ease;
-    }
-    .stButton > button:hover { background-color: #1565c0; border: none; }
-    .stButton > button:focus {
-        background-color: #1565c0;
-        border: none;
-        box-shadow: 0 0 0 2px rgba(25, 118, 210, 0.3);
-    }
-    .loading-container {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 1rem;
-        background-color: #f0f8ff;
-        border-radius: 8px;
-        border-left: 4px solid #1976d2;
-        margin: 1rem 0;
-    }
-    .loading-spinner {
-        width: 20px;
-        height: 20px;
-        border: 2px solid #e3f2fd;
-        border-top: 2px solid #1976d2;
-        border-radius: 50%;
-        animation: spin 1s linear infinite;
-    }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .loading-text { color: #1976d2; font-weight: 500; }
-    .stFileUploader > label { display: none; }
-
-    /* Code block label */
     .code-label {
         background-color: #1e1e1e;
         color: #9cdcfe;
-        padding: 4px 12px;
-        border-radius: 6px 6px 0 0;
-        font-size: 0.75rem;
+        padding: 3px 10px;
+        border-radius: 5px 5px 0 0;
+        font-size: 0.73rem;
         font-family: monospace;
         display: inline-block;
         margin-bottom: -4px;
     }
+    .backend-badge { font-size: 0.72rem; color: #888; margin-top: 4px; }
+    .mode-badge {
+        padding: 4px 10px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        display: inline-block;
+        margin-bottom: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+# ==============================================================================
+# 2. SESSION STATE INITIALIZATION
+# ==============================================================================
+def init_state():
+    if "chats" not in st.session_state:
+        st.session_state.chats = {
+            "Chat 1": [{"role": "assistant", "content": "Hello! I am Alies AI. How can I help you today?"}]
+        }
+    if "current_chat" not in st.session_state:
+        st.session_state.current_chat = "Chat 1"
+    if "chat_counter" not in st.session_state:
+        st.session_state.chat_counter = 1
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+    if "rag_pipeline" not in st.session_state:
+        st.session_state.rag_pipeline = RAGPipeline()
+    if "memory" not in st.session_state:
+        st.session_state.memory = ConversationMemory(max_turns=6)
+    if "llm_router" not in st.session_state:
+        st.session_state.llm_router = LLMRouter()
+    if "documents_loaded" not in st.session_state:
+        st.session_state.documents_loaded = 0
+    if "processed_files" not in st.session_state:
+        st.session_state.processed_files = set()
+    # Store current pipeline mode persistently
+    if "pipeline_mode" not in st.session_state:
+        st.session_state.pipeline_mode = "Standard Chat"
 
-# ─────────────────────────────────────────────
-# Feature: Render response with code highlight
-# ─────────────────────────────────────────────
+init_state()
+
+# ==============================================================================
+# 3. HELPERS
+# ==============================================================================
 def render_response(response: str):
-    """Render assistant response — plain text gets st.markdown,
-    code blocks get st.code with syntax highlighting."""
-    # Split on fenced code blocks  ```lang\n...\n```
     parts = re.split(r'(```[\w]*\n[\s\S]*?```)', response)
     for part in parts:
         if part.startswith('```'):
             lines = part.split('\n')
-            # First line is ```python / ```js / ``` etc.
             lang = lines[0].replace('```', '').strip() or 'python'
-            # Everything between first and last line is code
             code = '\n'.join(lines[1:]).rstrip('`').strip()
-            if lang:
-                st.markdown(f'<div class="code-label">🖥️ {lang}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="code-label">🖥️ {lang}</div>', unsafe_allow_html=True)
             st.code(code, language=lang)
         else:
             if part.strip():
                 st.markdown(part)
 
 
-# ─────────────────────────────────────────────
-# Session state
-# ─────────────────────────────────────────────
-def initialize_session_state():
-    if 'session_id' not in st.session_state:
-        st.session_state.session_id = str(uuid.uuid4())
-    if 'rag_pipeline' not in st.session_state:
-        st.session_state.rag_pipeline = RAGPipeline()
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
-    if 'documents_count' not in st.session_state:
-        st.session_state.documents_count = 0
-    if 'processed_files' not in st.session_state:
-        st.session_state.processed_files = set()
-    if 'processed_urls' not in st.session_state:
-        st.session_state.processed_urls = set()
-    if 'current_url' not in st.session_state:
-        st.session_state.current_url = ""
-    if 'file_uploader_key' not in st.session_state:
-        st.session_state.file_uploader_key = 0
-    if 'chat_input_key' not in st.session_state:
-        st.session_state.chat_input_key = 0
+def export_to_docx(messages):
+    doc = DocxDocument()
+    doc.add_heading(f"Chat Export — {st.session_state.current_chat}", level=1)
+    for msg in messages:
+        p = doc.add_paragraph()
+        p.add_run(f"{msg['role'].upper()}: ").bold = True
+        p.add_run(msg.get('content', ''))
+    bio = io.BytesIO()
+    doc.save(bio)
+    return bio.getvalue()
 
 
-def check_system_status():
-    try:
-        from src.llm_client import OllamaClient
-        return OllamaClient().check_connection()
-    except Exception as e:
-        print(f"Error checking system status: {e}")
-        return False
-
-
-def show_loading_indicator(message: str):
-    st.markdown(f"""
-    <div class="loading-container">
-        <div class="loading-spinner"></div>
-        <div class="loading-text">{message}</div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────
-# File processing
-# ─────────────────────────────────────────────
-def process_files(uploaded_files):
-    if not uploaded_files:
-        return
+def process_uploaded_files(uploaded_files):
+    """Process files and add them to RAG — returns True if any new file was loaded."""
     processor = DocumentProcessor()
-    total_chunks = 0
-
-    new_files = []
-    for file in uploaded_files:
-        file_key = f"{file.name}_{file.size}"
-        if file_key not in st.session_state.processed_files:
-            new_files.append(file)
-            st.session_state.processed_files.add(file_key)
-
-    if not new_files:
-        return
-
-    loading_placeholder = st.empty()
-    with loading_placeholder.container():
-        show_loading_indicator("Processing uploaded files and creating chunks...")
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for i, uploaded_file in enumerate(new_files):
-        status_text.text(f"Processing {uploaded_file.name}...")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
+    any_loaded = False
+    for f in uploaded_files:
+        key = f"{f.name}_{f.size}"
+        if key in st.session_state.processed_files:
+            continue
+        suffix = f.name.split('.')[-1]
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
+            tmp.write(f.getvalue())
+            tmp_path = tmp.name
         try:
-            chunks = processor.process_document(tmp_file_path, uploaded_file.name)
-            success = st.session_state.rag_pipeline.add_documents(
+            chunks = processor.process_document(tmp_path, f.name)
+            ok = st.session_state.rag_pipeline.add_documents(
                 chunks,
                 source_type="document",
-                source_name=uploaded_file.name,
+                source_name=f.name,
                 session_id=st.session_state.session_id
             )
-            if success:
-                total_chunks += len(chunks)
-            else:
-                st.warning(f"⚠️ Issues processing {uploaded_file.name}")
+            if ok:
+                st.session_state.documents_loaded += 1
+                st.session_state.processed_files.add(key)
+                any_loaded = True
+                st.success(f"✅ Loaded: {f.name} ({len(chunks)} chunks)")
         except Exception as e:
-            st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+            st.error(f"Error processing {f.name}: {e}")
         finally:
-            os.unlink(tmp_file_path)
-        progress_bar.progress((i + 1) / len(new_files))
-
-    loading_placeholder.empty()
-    status_text.empty()
-    progress_bar.empty()
-    st.session_state.documents_count += len(new_files)
-    if total_chunks > 0:
-        st.success(f"✅ Processed {len(new_files)} files ({total_chunks} chunks)")
+            os.unlink(tmp_path)
+    return any_loaded
 
 
-# ─────────────────────────────────────────────
-# URL processing
-# ─────────────────────────────────────────────
-def process_url(url):
-    if url in st.session_state.processed_urls:
-        st.info("This URL has already been processed.")
-        return
-    loading_placeholder = st.empty()
-    with loading_placeholder.container():
-        show_loading_indicator("Scraping web content and creating chunks...")
+def process_url(url: str):
+    """Scrape URL and add to RAG."""
+    scraper = WebScraper()
+    processor = DocumentProcessor()
     try:
-        scraper = WebScraper()
         content = scraper.scrape_url(url)
         if content:
-            processor = DocumentProcessor()
             chunks = processor.process_text(content, url)
-            success = st.session_state.rag_pipeline.add_documents(
+            ok = st.session_state.rag_pipeline.add_documents(
                 chunks,
                 source_type="web",
                 source_name=url,
                 session_id=st.session_state.session_id
             )
-            loading_placeholder.empty()
-            if success:
-                st.session_state.documents_count += 1
-                st.session_state.processed_urls.add(url)
-                st.success(f"✅ Processed content from URL ({len(chunks)} chunks)")
-                st.session_state.current_url = ""
-                st.rerun()
-            else:
-                st.warning("⚠️ Issues processing URL content")
+            if ok:
+                st.session_state.documents_loaded += 1
+                return True, f"✅ Scraped {len(chunks)} chunks from: {url}"
+            return False, "Failed to store scraped content."
+        return False, "Could not extract content from URL."
+    except Exception as e:
+        return False, f"Scraping error: {e}"
+
+
+def build_answer(user_input: str, llm_mode: str, pipeline_mode: str):
+    router: LLMRouter = st.session_state.llm_router
+    memory: ConversationMemory = st.session_state.memory
+    session_id = st.session_state.session_id
+    chat_history = memory.format_history(session_id, max_turns=4)
+    sources = []
+
+    # ── Web Search — always search live, ignore any loaded docs ──────────────
+    if pipeline_mode == "Web Search":
+        searcher = WebSearchClient(max_results=5)
+        results = searcher.search(user_input)
+        if not results:
+            answer = "I could not find any web results for your question. Please check your internet connection."
+            sources = []
         else:
-            loading_placeholder.empty()
-            st.error("❌ Failed to scrape content from the URL")
-    except Exception as e:
-        loading_placeholder.empty()
-        st.error(f"❌ Error: {str(e)}")
+            context = searcher.format_results_as_context(results)
+            sources = [r['url'] for r in results if r.get('url')]
+            # Use dedicated web search method — avoids "context doesn't contain" response
+            from src.llm_client import OllamaClient
+            web_client = OllamaClient()
+            answer = web_client.generate_web_search_response(user_input, context, chat_history)
 
+    # ── RAG — only if docs are loaded ────────────────────────────────────────
+    elif pipeline_mode in ("Use Uploaded Files (RAG)", "Web Scraping") \
+            and st.session_state.documents_loaded > 0:
+        result = st.session_state.rag_pipeline.query(
+            user_input, session_id=session_id
+        )
+        # query() may return (answer, sources) or (answer, sources, extra)
+        answer = result[0]
+        sources = result[1] if len(result) > 1 else []
 
-# ─────────────────────────────────────────────
-# Chat input handler
-# ─────────────────────────────────────────────
-def handle_chat_input(user_question):
-    from src.llm_client import OllamaClient
-    client = OllamaClient()
-    is_code = client.is_code_request(user_question)
-
-    # Code requests don't need documents
-    if not is_code and st.session_state.documents_count == 0:
-        st.warning("⚠️ Please add some documents or web content first!")
-        return
-
-    st.session_state.chat_history.append({'role': 'user', 'content': user_question})
-
-    with st.spinner("Thinking..."):
-        try:
-            if is_code:
-                # Skip RAG — go directly to coder model with no context
-                response = client.generate_response(user_question, context="")
-                sources = []
-            else:
-                # Normal RAG flow
-                response, sources = st.session_state.rag_pipeline.query(
-                    user_question,
-                    session_id=st.session_state.session_id
-                )
-
-            st.session_state.chat_history.append({
-                'role': 'assistant',
-                'content': response,
-                'sources': sources
-            })
-
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
-
-# ─────────────────────────────────────────────
-# Clear all data
-# ─────────────────────────────────────────────
-def clear_all_data():
-    st.session_state.chat_history = []
-    st.session_state.documents_count = 0
-    st.session_state.processed_files = set()
-    st.session_state.processed_urls = set()
-    st.session_state.current_url = ""
-    st.session_state.session_id = str(uuid.uuid4())
-    st.session_state.file_uploader_key += 1
-    st.session_state.chat_input_key += 1
-    try:
-        st.session_state.rag_pipeline.clear_session(st.session_state.session_id)
-    except Exception as e:
-        print(f"Error clearing session data: {e}")
-
-
-# ─────────────────────────────────────────────
-# Main app
-# ─────────────────────────────────────────────
-def main():
-    initialize_session_state()
-
-    st.title("🤖 RAG Assistant")
-    st.markdown("Upload documents or add web content, then chat with your data")
-
-    ollama_running = check_system_status()
-
-    if not ollama_running:
-        st.markdown("""
-        <div class="status-indicator status-warning">
-            ⚠️ Ollama not detected — please run <code>ollama serve</code>
-        </div>
-        """, unsafe_allow_html=True)
-    elif st.session_state.documents_count > 0:
-        st.markdown(f"""
-        <div class="status-indicator status-ready">
-            📚 Ready to chat • {st.session_state.documents_count} sources loaded
-        </div>
-        """, unsafe_allow_html=True)
+    # ── Standard Chat — pure LLM, no context ─────────────────────────────────
     else:
-        st.markdown("""
-        <div class="status-indicator status-empty">
-            📁 Add some documents or web content to get started
-        </div>
-        """, unsafe_allow_html=True)
-
-    # ── Add Content ──
-    st.markdown("### Add Content")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.markdown("**Upload Files**")
-        uploaded_files = st.file_uploader(
-            "Choose files",
-            type=['pdf', 'txt', 'csv'],
-            accept_multiple_files=True,
-            label_visibility="collapsed",
-            key=f"file_uploader_{st.session_state.file_uploader_key}"
+        answer = router.generate_response(
+            user_input, context="", mode="smart", chat_history=chat_history
         )
-        if uploaded_files:
-            process_files(uploaded_files)
 
-    with col2:
-        st.markdown("**Add Web Content**")
-        url = st.text_input(
-            "Enter URL",
-            placeholder="https://example.com/article",
-            label_visibility="collapsed",
-            key="url_input",
-            value=st.session_state.current_url
-        )
-        add_url_clicked = st.button("🌐 Add URL", use_container_width=True, type="primary")
-        if add_url_clicked and url and url.startswith(('http://', 'https://')):
-            process_url(url)
-        elif add_url_clicked and url:
-            st.error("Please enter a valid URL starting with http:// or https://")
-        elif add_url_clicked:
-            st.error("Please enter a URL")
+    memory.add_turn(session_id, user_input, answer)
+    return answer, sources
 
-    # ── Chat ──
-    st.markdown("### Chat")
 
-    col1, col2, col3 = st.columns([1, 1, 4])
-    with col1:
-        if st.button("🗑️ Clear All", use_container_width=True,
-                     help="Clear chat, documents, URLs, and uploaded files"):
-            clear_all_data()
-            st.rerun()
+# ==============================================================================
+# 4. SIDEBAR
+# ==============================================================================
+with st.sidebar:
+    st.markdown("<h2 style='text-align:center;'>🤖 Alies AI System</h2>", unsafe_allow_html=True)
 
-    # ── Chat history with code highlighting ──
-    if st.session_state.chat_history:
-        for message in st.session_state.chat_history:
-            if message['role'] == 'user':
-                with st.chat_message("user"):
-                    st.write(message['content'])
-            else:
-                with st.chat_message("assistant"):
-                    # render_response handles plain text AND code blocks
-                    render_response(message['content'])
-                    if message.get('sources'):
-                        st.markdown("**Sources:**")
-                        for source in message['sources']:
-                            st.markdown(
-                                f'<span class="source-tag">{source}</span>',
-                                unsafe_allow_html=True
-                            )
-
-    # ── Input form ──
-    with st.form(key=f"chat_form_{st.session_state.chat_input_key}", clear_on_submit=True):
-        user_question = st.text_input(
-            "Ask a question about your content:",
-            placeholder="e.g. Write a Python function to sort a list / What is this document about?",
-            key=f"chat_input_{st.session_state.chat_input_key}"
-        )
-        send_clicked = st.form_submit_button("💬 Send", use_container_width=True, type="primary")
-
-    if send_clicked and user_question.strip():
-        handle_chat_input(user_question)
-        st.session_state.chat_input_key += 1
+    if st.button("➕ New Chat", use_container_width=True):
+        st.session_state.chat_counter += 1
+        name = f"Chat {st.session_state.chat_counter}"
+        st.session_state.chats[name] = [
+            {"role": "assistant", "content": f"Welcome to {name}! How can I assist you?"}
+        ]
+        st.session_state.current_chat = name
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.processed_files = set()
+        st.session_state.documents_loaded = 0
+        st.session_state.pipeline_mode = "Standard Chat"
         st.rerun()
 
+    st.markdown("---")
+    st.markdown("<h3 style='text-align:center;'>Chat History</h3>", unsafe_allow_html=True)
 
-if __name__ == "__main__":
-    main()
+    for chat_id in list(st.session_state.chats.keys()):
+        col_chat, col_opts = st.columns([4, 1])
+        is_active = chat_id == st.session_state.current_chat
+        with col_chat:
+            if st.button(
+                f"💬 {chat_id}", key=f"sel_{chat_id}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary"
+            ):
+                st.session_state.current_chat = chat_id
+                st.rerun()
+        with col_opts:
+            with st.popover("⋮"):
+                new_name = st.text_input("Rename", value=chat_id,
+                                         key=f"rename_{chat_id}",
+                                         label_visibility="collapsed")
+                if st.button("✏️ Save", key=f"save_{chat_id}", use_container_width=True):
+                    if new_name != chat_id and new_name not in st.session_state.chats:
+                        st.session_state.chats[new_name] = st.session_state.chats.pop(chat_id)
+                        if st.session_state.current_chat == chat_id:
+                            st.session_state.current_chat = new_name
+                        st.rerun()
+                docx_data = export_to_docx(st.session_state.chats[chat_id])
+                st.download_button(
+                    "📄 Export DOCX", data=docx_data,
+                    file_name=f"{chat_id}_export.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"exp_{chat_id}", use_container_width=True
+                )
+                if st.button("🗑️ Delete", key=f"del_{chat_id}",
+                             use_container_width=True, type="primary"):
+                    if len(st.session_state.chats) > 1:
+                        del st.session_state.chats[chat_id]
+                        if st.session_state.current_chat == chat_id:
+                            st.session_state.current_chat = list(st.session_state.chats.keys())[0]
+                        st.rerun()
+                    else:
+                        st.error("Cannot delete the last chat.")
+
+    st.markdown("---")
+    available_modes = st.session_state.llm_router.available_modes()
+    mode_labels = [label for _, label in available_modes]
+    mode_values = [val for val, _ in available_modes]
+    selected_idx = st.selectbox(
+        "🧠 Model / Mode",
+        range(len(mode_labels)),
+        format_func=lambda i: mode_labels[i]
+    )
+    selected_mode = mode_values[selected_idx]
+
+    st.markdown("---")
+    if st.session_state.documents_loaded > 0:
+        st.success(f"📚 {st.session_state.documents_loaded} source(s) loaded")
+        st.caption(f"Pipeline: **{st.session_state.pipeline_mode}**")
+    else:
+        st.info("📁 No documents loaded yet")
+
+    st.markdown("---")
+    if st.button("🗑️ Clear All Chats", use_container_width=True, type="primary"):
+        st.session_state.chats = {
+            "Chat 1": [{"role": "assistant",
+                        "content": "All history cleared. Fresh session started."}]
+        }
+        st.session_state.current_chat = "Chat 1"
+        st.session_state.chat_counter = 1
+        st.session_state.session_id = str(uuid.uuid4())
+        st.session_state.processed_files = set()
+        st.session_state.documents_loaded = 0
+        st.session_state.pipeline_mode = "Standard Chat"
+        st.session_state.memory.clear(st.session_state.session_id)
+        st.rerun()
+
+# ==============================================================================
+# 5. MAIN CHAT AREA
+# ==============================================================================
+header_col1, header_col2 = st.columns([3, 1])
+with header_col1:
+    st.subheader(f"Alies RAG Engine » {st.session_state.current_chat}")
+with header_col2:
+    st.markdown(
+        f"<div class='backend-badge'>LLM: {selected_mode} | Pipeline: {st.session_state.pipeline_mode}</div>",
+        unsafe_allow_html=True
+    )
+
+st.markdown("---")
+
+for msg in st.session_state.chats[st.session_state.current_chat]:
+    avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
+    with st.chat_message(msg["role"], avatar=avatar):
+        render_response(msg["content"])
+        if msg.get("sources"):
+            st.markdown("**Sources:**")
+            for src in msg["sources"]:
+                st.markdown(f'<span class="source-tag">{src}</span>',
+                            unsafe_allow_html=True)
+
+# ==============================================================================
+# 6. TOOLBAR
+# ==============================================================================
+tool_col1, tool_col2, tool_col3, tool_col4 = st.columns([1.5, 4, 1, 1])
+
+with tool_col1:
+    with st.popover("➕ Pipeline Options", use_container_width=True):
+        chosen_mode = st.radio(
+            "Select Pipeline Mode:",
+            ["Standard Chat", "Use Uploaded Files (RAG)", "Web Search", "Web Scraping"],
+            index=["Standard Chat", "Use Uploaded Files (RAG)", "Web Search", "Web Scraping"]
+                  .index(st.session_state.pipeline_mode)
+        )
+        # Save chosen mode to session state immediately
+        if chosen_mode != st.session_state.pipeline_mode:
+            st.session_state.pipeline_mode = chosen_mode
+            st.rerun()
+
+with tool_col2:
+    current_pipeline = st.session_state.pipeline_mode
+
+    if current_pipeline == "Use Uploaded Files (RAG)":
+        uploaded_files = st.file_uploader(
+            "Upload files",
+            accept_multiple_files=True,
+            type=["pdf", "docx", "pptx", "xlsx", "txt", "csv", "md"],
+            label_visibility="collapsed",
+            key="file_uploader_widget"
+        )
+        if uploaded_files:
+            any_new = process_uploaded_files(uploaded_files)
+            if any_new:
+                st.info(f"✅ Files loaded! Now ask your question in the chat below.")
+
+    elif current_pipeline == "Web Scraping":
+        # Show already scraped sources
+        if st.session_state.documents_loaded > 0:
+            st.success(f"✅ {st.session_state.documents_loaded} source(s) loaded — ask your question below!")
+        else:
+            url_col1, url_col2 = st.columns([3, 1])
+            with url_col1:
+                url_input = st.text_input(
+                    "URL", placeholder="https://example.com",
+                    label_visibility="collapsed",
+                    key="scrape_url_input"
+                )
+            with url_col2:
+                scrape_clicked = st.button("🌐 Scrape", use_container_width=True)
+
+            if scrape_clicked and url_input:
+                with st.spinner(f"Scraping {url_input}..."):
+                    success, msg = process_url(url_input)
+                if success:
+                    st.success("✅ Done! Now type your question in the chat below.")
+                    st.session_state.pipeline_mode = "Web Scraping"
+                else:
+                    st.error(msg)
+
+    elif current_pipeline == "Web Search":
+        st.info("🌐 **Web Search active** — type your question and it will search the web live.")
+
+    else:
+        st.caption("💬 Standard Chat — ask anything directly.")
+
+with tool_col3:
+    if st.button("🎙️ Audio", use_container_width=True):
+        st.toast("Voice input coming soon!", icon="🎙️")
+
+with tool_col4:
+    if st.button("🧹 Clear Frame", use_container_width=True):
+        st.session_state.chats[st.session_state.current_chat] = [
+            {"role": "assistant", "content": "Frame cleared. Ready for new input."}
+        ]
+        st.session_state.memory.clear(st.session_state.session_id)
+        st.rerun()
+
+# ==============================================================================
+# 7. CHAT INPUT & RESPONSE
+# ==============================================================================
+if user_input := st.chat_input("Message Alies AI..."):
+
+    # Auto-rename chat from first message
+    current_msgs = st.session_state.chats[st.session_state.current_chat]
+    if len(current_msgs) == 1 and st.session_state.current_chat.startswith("Chat "):
+        new_name = (user_input[:20] + "...") if len(user_input) > 20 else user_input
+        if new_name in st.session_state.chats:
+            new_name += f" ({st.session_state.chat_counter})"
+        st.session_state.chats[new_name] = st.session_state.chats.pop(
+            st.session_state.current_chat
+        )
+        st.session_state.current_chat = new_name
+
+    st.session_state.chats[st.session_state.current_chat].append(
+        {"role": "user", "content": user_input}
+    )
+    with st.chat_message("user", avatar="🧑‍💻"):
+        st.write(user_input)
+
+    with st.chat_message("assistant", avatar="🤖"):
+        with st.spinner("Thinking..."):
+            try:
+                answer, sources = build_answer(
+                    user_input,
+                    selected_mode,
+                    st.session_state.pipeline_mode
+                )
+            except Exception as e:
+                answer = f"❌ Error: {e}"
+                sources = []
+
+        render_response(answer)
+        if sources:
+            st.markdown("**Sources:**")
+            for src in sources:
+                st.markdown(f'<span class="source-tag">{src}</span>',
+                            unsafe_allow_html=True)
+
+    st.session_state.chats[st.session_state.current_chat].append({
+        "role": "assistant",
+        "content": answer,
+        "sources": sources
+    })
+    st.rerun()

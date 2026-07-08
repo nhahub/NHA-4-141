@@ -1,0 +1,13 @@
+# Extra dependencies for QLoRA fine-tuning + GGUF conversion.
+# Install with: pip install -r finetune/requirements-finetune.txt --break-system-packages
+# (kept separate from the main requirements.txt since the app itself doesn't need
+#  a GPU training stack to run — only whoever is doing the fine-tuning does)
+
+torch
+transformers>=4.45.0
+peft>=0.13.0
+bitsandbytes>=0.44.0
+accelerate>=0.34.0
+datasets
+trl>=0.11.0
+sentencepiece
