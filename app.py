@@ -13,6 +13,8 @@ from src.web_scraper import WebScraper
 from src.web_search import WebSearchClient
 from src.llm_router import LLMRouter
 from src.conversation_memory import ConversationMemory
+from streamlit_mic_recorder import mic_recorder
+from src.voice_assistant import VoiceAssistant
 
 # ==============================================================================
 # 1. PAGE CONFIGURATION
@@ -87,8 +89,22 @@ def init_state():
     # Store current pipeline mode persistently
     if "pipeline_mode" not in st.session_state:
         st.session_state.pipeline_mode = "Standard Chat"
+    # Image attached for the vision / OCR pipeline
+    if "pending_image_bytes" not in st.session_state:
+        st.session_state.pending_image_bytes = None
+    if "pending_image_name" not in st.session_state:
+        st.session_state.pending_image_name = None
 
 init_state()
+
+# ==============================================================================
+# 2b. VOICE ASSISTANT (cached — loading Whisper is expensive, do it once)
+# ==============================================================================
+@st.cache_resource
+def load_voice_assistant():
+    return VoiceAssistant()
+
+voice_assistant = load_voice_assistant()
 
 # ==============================================================================
 # 3. HELPERS
@@ -174,15 +190,22 @@ def process_url(url: str):
         return False, f"Scraping error: {e}"
 
 
-def build_answer(user_input: str, llm_mode: str, pipeline_mode: str):
+def build_answer(user_input: str, llm_mode: str, pipeline_mode: str, image_bytes: bytes = None):
     router: LLMRouter = st.session_state.llm_router
     memory: ConversationMemory = st.session_state.memory
     session_id = st.session_state.session_id
     chat_history = memory.format_history(session_id, max_turns=4)
     sources = []
 
+    # ── Image / OCR — attached image always goes to the vision model ─────────
+    if pipeline_mode == "Image / OCR" and image_bytes is not None:
+        answer = router.generate_response(
+            user_input, context="", mode=llm_mode,
+            image_bytes=image_bytes, chat_history=chat_history
+        )
+
     # ── Web Search — always search live, ignore any loaded docs ──────────────
-    if pipeline_mode == "Web Search":
+    elif pipeline_mode == "Web Search":
         searcher = WebSearchClient(max_results=5)
         results = searcher.search(user_input)
         if not results:
@@ -233,6 +256,8 @@ with st.sidebar:
         st.session_state.processed_files = set()
         st.session_state.documents_loaded = 0
         st.session_state.pipeline_mode = "Standard Chat"
+        st.session_state.pending_image_bytes = None
+        st.session_state.pending_image_name = None
         st.rerun()
 
     st.markdown("---")
@@ -307,6 +332,8 @@ with st.sidebar:
         st.session_state.processed_files = set()
         st.session_state.documents_loaded = 0
         st.session_state.pipeline_mode = "Standard Chat"
+        st.session_state.pending_image_bytes = None
+        st.session_state.pending_image_name = None
         st.session_state.memory.clear(st.session_state.session_id)
         st.rerun()
 
@@ -343,8 +370,8 @@ with tool_col1:
     with st.popover("➕ Pipeline Options", use_container_width=True):
         chosen_mode = st.radio(
             "Select Pipeline Mode:",
-            ["Standard Chat", "Use Uploaded Files (RAG)", "Web Search", "Web Scraping"],
-            index=["Standard Chat", "Use Uploaded Files (RAG)", "Web Search", "Web Scraping"]
+            ["Standard Chat", "Use Uploaded Files (RAG)", "Web Search", "Web Scraping", "Image / OCR"],
+            index=["Standard Chat", "Use Uploaded Files (RAG)", "Web Search", "Web Scraping", "Image / OCR"]
                   .index(st.session_state.pipeline_mode)
         )
         # Save chosen mode to session state immediately
@@ -369,38 +396,65 @@ with tool_col2:
                 st.info(f"✅ Files loaded! Now ask your question in the chat below.")
 
     elif current_pipeline == "Web Scraping":
-        # Show already scraped sources
+        # Show already scraped sources (if any), but keep the input available
+        # so the user can scrape additional URLs instead of getting stuck.
         if st.session_state.documents_loaded > 0:
-            st.success(f"✅ {st.session_state.documents_loaded} source(s) loaded — ask your question below!")
-        else:
-            url_col1, url_col2 = st.columns([3, 1])
-            with url_col1:
-                url_input = st.text_input(
-                    "URL", placeholder="https://example.com",
-                    label_visibility="collapsed",
-                    key="scrape_url_input"
-                )
-            with url_col2:
-                scrape_clicked = st.button("🌐 Scrape", use_container_width=True)
+            st.success(f"✅ {st.session_state.documents_loaded} source(s) loaded — ask your question below, or add another URL:")
 
-            if scrape_clicked and url_input:
-                with st.spinner(f"Scraping {url_input}..."):
-                    success, msg = process_url(url_input)
-                if success:
-                    st.success("✅ Done! Now type your question in the chat below.")
-                    st.session_state.pipeline_mode = "Web Scraping"
-                else:
-                    st.error(msg)
+        url_col1, url_col2 = st.columns([3, 1])
+        with url_col1:
+            url_input = st.text_input(
+                "URL", placeholder="https://example.com",
+                label_visibility="collapsed",
+                key="scrape_url_input"
+            )
+        with url_col2:
+            scrape_clicked = st.button("🌐 Scrape", use_container_width=True)
+
+        if scrape_clicked and url_input:
+            with st.spinner(f"Scraping {url_input}..."):
+                success, msg = process_url(url_input)
+            if success:
+                st.success("✅ Done! Now type your question in the chat below.")
+                st.session_state.pipeline_mode = "Web Scraping"
+                st.rerun()
+            else:
+                st.error(msg)
 
     elif current_pipeline == "Web Search":
         st.info("🌐 **Web Search active** — type your question and it will search the web live.")
+
+    elif current_pipeline == "Image / OCR":
+        uploaded_image = st.file_uploader(
+            "Upload an image",
+            type=["png", "jpg", "jpeg", "webp"],
+            label_visibility="collapsed",
+            key="image_uploader_widget"
+        )
+        if uploaded_image is not None:
+            st.session_state.pending_image_bytes = uploaded_image.getvalue()
+            st.session_state.pending_image_name = uploaded_image.name
+        if st.session_state.pending_image_bytes:
+            st.image(st.session_state.pending_image_bytes, caption=st.session_state.pending_image_name, width=180)
+            st.caption("✅ Image attached — ask your question below (e.g. \"what text is in this image?\").")
+            if st.button("🗑️ Remove image", key="remove_image_btn"):
+                st.session_state.pending_image_bytes = None
+                st.session_state.pending_image_name = None
+                st.rerun()
+        else:
+            st.caption("📷 Upload an image, then ask a question about it below (OCR, description, etc.).")
 
     else:
         st.caption("💬 Standard Chat — ask anything directly.")
 
 with tool_col3:
-    if st.button("🎙️ Audio", use_container_width=True):
-        st.toast("Voice input coming soon!", icon="🎙️")
+    voice_audio = mic_recorder(
+        start_prompt="🎙️ Audio",
+        stop_prompt="⏹ Stop",
+        just_once=True,
+        use_container_width=True,
+        key="voice_recorder"
+    )
 
 with tool_col4:
     if st.button("🧹 Clear Frame", use_container_width=True):
@@ -413,8 +467,12 @@ with tool_col4:
 # ==============================================================================
 # 7. CHAT INPUT & RESPONSE
 # ==============================================================================
-if user_input := st.chat_input("Message Alies AI..."):
-
+def process_user_message(user_input: str, spoken: bool = False):
+    """Shared handler for both typed and voice-transcribed messages.
+    Runs the question through the same pipeline routing (RAG / web search /
+    vision / standard chat) and appends both turns to the active chat.
+    Returns the assistant's answer text (used for TTS playback on voice turns).
+    """
     # Auto-rename chat from first message
     current_msgs = st.session_state.chats[st.session_state.current_chat]
     if len(current_msgs) == 1 and st.session_state.current_chat.startswith("Chat "):
@@ -430,7 +488,7 @@ if user_input := st.chat_input("Message Alies AI..."):
         {"role": "user", "content": user_input}
     )
     with st.chat_message("user", avatar="🧑‍💻"):
-        st.write(user_input)
+        st.write(("🎙️ " if spoken else "") + user_input)
 
     with st.chat_message("assistant", avatar="🤖"):
         with st.spinner("Thinking..."):
@@ -438,7 +496,8 @@ if user_input := st.chat_input("Message Alies AI..."):
                 answer, sources = build_answer(
                     user_input,
                     selected_mode,
-                    st.session_state.pipeline_mode
+                    st.session_state.pipeline_mode,
+                    image_bytes=st.session_state.pending_image_bytes
                 )
             except Exception as e:
                 answer = f"❌ Error: {e}"
@@ -451,9 +510,42 @@ if user_input := st.chat_input("Message Alies AI..."):
                 st.markdown(f'<span class="source-tag">{src}</span>',
                             unsafe_allow_html=True)
 
+        # Voice turns get a spoken reply back
+        if spoken:
+            try:
+                audio_output = voice_assistant.text_to_speech(answer)
+                st.audio(audio_output, autoplay=True)
+            except Exception as e:
+                st.warning(f"Could not generate voice reply: {e}")
+
     st.session_state.chats[st.session_state.current_chat].append({
         "role": "assistant",
         "content": answer,
         "sources": sources
     })
+    return answer
+
+
+if user_input := st.chat_input("Message Alies AI..."):
+    process_user_message(user_input, spoken=False)
+    st.rerun()
+
+# ── Voice input: record -> transcribe -> route through the same pipeline ──
+if voice_audio:
+    with st.spinner("Transcribing your voice..."):
+        try:
+            audio_path = voice_assistant.save_audio(
+                voice_audio["bytes"], "voice_input.wav"
+            )
+            transcribed_text = voice_assistant.speech_to_text(audio_path)
+        except Exception as e:
+            transcribed_text = ""
+            st.error(f"Voice transcription failed: {e}")
+
+    if transcribed_text.strip():
+        process_user_message(transcribed_text, spoken=True)
+    else:
+        st.warning("Didn't catch that — please try recording again.")
+
+    voice_assistant.clean_up()
     st.rerun()

@@ -1,56 +1,90 @@
 import os
-from typing import List, Dict, Any, Optional
-import faiss
-import numpy as np
-from langchain_core.documents import Document
 import uuid
-import pickle
+from typing import List, Dict, Any, Optional
+import chromadb
+from langchain_core.documents import Document
 
+class ChromaVectorStore:
 
-class FAISSVectorStore:
     """
-    FAISS vector store — replaces Qdrant completely.
+    Chroma vector store:
     Runs 100% in memory, no server needed, no connection errors.
     """
 
-    def __init__(self):
-        self.vector_size = 768
-        self.index = faiss.IndexFlatL2(self.vector_size)
-        # Store metadata separately — FAISS only stores vectors
-        self.documents: List[Document] = []
-        self.ids: List[str] = []
-        print("FAISS vector store initialized ✅")
+    def __init__(self, collection_name: str = "rag_collection"):
+        # Initialize an in-memory Chroma client
+        self.client = chromadb.Client()
+        self.collection_name = collection_name
+        
+        # Create or get the collection (using L2 distance by default)
+        self.collection = self.client.get_or_create_collection(
+            name=self.collection_name,
+            metadata={"hnsw:space": "l2"} 
+        )
+        print("Chroma vector store initialized ✅")
+
+    def _sanitize_metadata(self, metadata: dict) -> dict:
+        """
+        Helper method to ensure both keys and values are Chroma-compatible.
+        Chroma requires Keys to be strings, and Values to be str, int, float, or bool.
+        """
+        if not metadata:
+            return {}
+            
+        sanitized = {}
+        for key, value in metadata.items():
+            # Chroma keys MUST be strings
+            safe_key = str(key) 
+            
+            if value is None:
+                continue # Skip None values completely
+            elif isinstance(value, (str, int, float, bool)):
+                sanitized[safe_key] = value
+            elif isinstance(value, list):
+                # Convert lists to comma-separated strings
+                sanitized[safe_key] = ", ".join(map(str, value))
+            else:
+                # Convert any other weird Python object (like dicts) to string
+                sanitized[safe_key] = str(value)
+                
+        return sanitized
 
     def add_documents(self, documents: List[Document], embeddings: List[List[float]]) -> bool:
         try:
             valid_docs = []
             valid_embeddings = []
+            metadatas = [] 
+            ids = []
 
             for doc, emb in zip(documents, embeddings):
                 if not emb or len(emb) == 0:
                     continue
-                if len(emb) != self.vector_size:
-                    print(f"Skipping embedding with wrong size: {len(emb)} != {self.vector_size}")
-                    continue
-                valid_docs.append(doc)
+                
+                valid_docs.append(doc.page_content)
                 valid_embeddings.append(emb)
+                
+                # Sanitize before adding
+                cleaned_metadata = self._sanitize_metadata(doc.metadata)
+                metadatas.append(cleaned_metadata)
+                
+                ids.append(str(uuid.uuid4()))
 
             if not valid_docs:
                 print("No valid documents to add")
                 return False
 
-            vectors = np.array(valid_embeddings, dtype=np.float32)
-            self.index.add(vectors)
+            self.collection.add(
+                documents=valid_docs,
+                embeddings=valid_embeddings,
+                metadatas=metadatas,
+                ids=ids
+            )
 
-            for doc in valid_docs:
-                self.documents.append(doc)
-                self.ids.append(str(uuid.uuid4()))
-
-            print(f"✅ Added {len(valid_docs)} documents to FAISS. Total: {len(self.documents)}")
+            print(f"✅ Added {len(valid_docs)} documents to Chroma. Total: {self.collection.count()}")
             return True
 
         except Exception as e:
-            print(f"Error adding documents to FAISS: {e}")
+            print(f"Error adding documents to Chroma: {e}")
             return False
 
     def similarity_search(
@@ -63,93 +97,88 @@ class FAISSVectorStore:
             if not query_embedding or len(query_embedding) == 0:
                 return []
 
-            if self.index.ntotal == 0:
-                print("FAISS index is empty — no documents loaded yet")
+            if self.collection.count() == 0:
+                print("Chroma collection is empty — no documents loaded yet")
                 return []
 
-            query_vector = np.array([query_embedding], dtype=np.float32)
+            # Build where clause for metadata filtering
+            where_clause = filter_dict if filter_dict else None
 
-            # Search more candidates if filtering is needed
-            search_k = min(self.index.ntotal, k * 10 if filter_dict else k)
-            distances, indices = self.index.search(query_vector, search_k)
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=min(k, self.collection.count()),
+                where=where_clause,
+                include=["documents", "metadatas"]
+            )
 
-            results = []
-            for idx in indices[0]:
-                if idx == -1 or idx >= len(self.documents):
-                    continue
+            documents = []
+            if results and results.get("documents") and len(results["documents"]) > 0:
+                for i in range(len(results["documents"][0])):
+                    content = results["documents"][0][i]
+                    metadata = results["metadatas"][0][i] if results.get("metadatas") else {}
+                    documents.append(Document(page_content=content, metadata=metadata))
 
-                doc = self.documents[idx]
-
-                # Apply metadata filters if provided
-                if filter_dict:
-                    match = all(
-                        doc.metadata.get(key) == value
-                        for key, value in filter_dict.items()
-                    )
-                    if not match:
-                        continue
-
-                results.append(doc)
-                if len(results) >= k:
-                    break
-
-            return results
+            return documents
 
         except Exception as e:
-            print(f"Error in FAISS similarity search: {e}")
+            print(f"Error in Chroma similarity search: {e}")
             return []
 
     def get_documents_by_session(self, session_id: str) -> List[dict]:
         try:
-            return [
-                {
-                    "id": self.ids[i],
-                    "content": doc.page_content,
-                    "source_type": doc.metadata.get("source_type"),
-                    "source_name": doc.metadata.get("source_name"),
-                    "chunk_id": doc.metadata.get("chunk_id"),
-                    "page": doc.metadata.get("page")
-                }
-                for i, doc in enumerate(self.documents)
-                if doc.metadata.get("session_id") == session_id
-            ]
+            results = self.collection.get(
+                where={"session_id": session_id},
+                include=["documents", "metadatas"]
+            )
+            
+            if not results or not results.get("documents"):
+                return []
+
+            formatted_results = []
+            for i in range(len(results["ids"])):
+                metadata = results["metadatas"][i]
+                formatted_results.append({
+                    "id": results["ids"][i],
+                    "content": results["documents"][i],
+                    "source_type": metadata.get("source_type"),
+                    "source_name": metadata.get("source_name"),
+                    "chunk_id": metadata.get("chunk_id"),
+                    "page": metadata.get("page")
+                })
+            return formatted_results
+
         except Exception as e:
             print(f"Error getting documents by session: {e}")
             return []
 
     def delete_by_session(self, session_id: str) -> bool:
-        """Remove all documents for a session and rebuild the FAISS index."""
         try:
-            keep_docs = []
-            keep_ids = []
-            keep_embeddings = []
-
-            # We need to rebuild — collect docs to keep
-            for i, doc in enumerate(self.documents):
-                if doc.metadata.get("session_id") != session_id:
-                    keep_docs.append(doc)
-                    keep_ids.append(self.ids[i])
-
-            # Rebuild index without deleted docs
-            self.index = faiss.IndexFlatL2(self.vector_size)
-            self.documents = keep_docs
-            self.ids = keep_ids
-
-            print(f"Deleted session {session_id} — {len(self.documents)} docs remain")
+            self.collection.delete(
+                where={"session_id": session_id}
+            )
+            print(f"Deleted session {session_id} from Chroma. Remaining docs: {self.collection.count()}")
             return True
 
         except Exception as e:
-            print(f"Error deleting session from FAISS: {e}")
+            print(f"Error deleting session from Chroma: {e}")
             return False
 
     def get_collection_info(self) -> dict:
-        return {
-            "name": "faiss_index",
-            "vector_size": self.vector_size,
-            "vectors_count": self.index.ntotal,
-            "points_count": len(self.documents)
-        }
+        try:
+            count = self.collection.count()
+            return {
+                "name": self.collection_name,
+                "vector_size": "Dynamic", 
+                "vectors_count": count,
+                "points_count": count
+            }
+        except Exception:
+             return {
+                "name": self.collection_name,
+                "vector_size": "Unknown",
+                "vectors_count": 0,
+                "points_count": 0
+            }
 
-
-# Keep old name as alias so rag_pipeline.py doesn't need changes
-QdrantVectorStore = FAISSVectorStore
+# Keep old name as alias
+QdrantVectorStore = ChromaVectorStore

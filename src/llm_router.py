@@ -53,7 +53,7 @@ class LLMRouter:
         code_model = os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:1.5b")
         self.code_backend = (f"ollama:{code_model}", OllamaClient(model=code_model, role="code"))
 
-        vision_model = os.getenv("OLLAMA_VISION_MODEL", "qwen2.5-vl")
+        vision_model = os.getenv("OLLAMA_VISION_MODEL", "qwen2.5vl:3b")
         self.vision_backend = (f"ollama:{vision_model}", QwenVisionClient(model=vision_model))
 
         self.intent_router = IntentRouter(classifier_model=local_model)

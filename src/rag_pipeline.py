@@ -2,7 +2,7 @@ import os
 from typing import List, Tuple, Optional, Union, Dict
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from .vector_store import QdrantVectorStore
+from .vector_store import ChromaVectorStore
 from .llm_router import LLMRouter
 from .embeddings import EmbeddingClient
 from .web_search import WebSearchClient
@@ -14,6 +14,7 @@ from .long_term_memory import LongTermMemory
 from .memory_scorer import MemoryImportanceScorer
 
 class RAGPipeline:
+    
     """
     Main RAG (Retrieval-Augmented Generation) pipeline orchestrating all components.
     
@@ -32,7 +33,7 @@ class RAGPipeline:
     def __init__(self):
         """Initialize all RAG pipeline components"""
         # Vector store for document embeddings with session-based filtering
-        self.vector_store = QdrantVectorStore()
+        self.vector_store = ChromaVectorStore()
         
         # LLM router: tries OpenAI primary -> OpenAI secondary -> local Ollama
         # model in order (any tier not configured in .env is skipped)
